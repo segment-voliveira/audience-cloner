@@ -1,4 +1,4 @@
-# lensgroup-audience-cloner
+# audience-cloner
 
 A Python CLI over the [Segment Public API](https://docs.segmentapis.com/). Today it clones Engage
 audiences — definition, destinations, and activations; the command structure
