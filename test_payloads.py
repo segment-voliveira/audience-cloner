@@ -11,7 +11,15 @@ thing worth asserting.
 
 import unittest
 
-from segment import activation_payload, audience_payload, connection_payload, parse_env_file
+from segment import (
+    SegmentError,
+    activation_payload,
+    audience_payload,
+    connection_payload,
+    pair_connections,
+    parse_env_file,
+    plan_target,
+)
 
 AUDIENCE_KEYS = {"name", "enabled", "description", "definition", "audienceType", "options"}
 DEFINITION_KEYS = {"query", "targetEntity"}
@@ -274,6 +282,71 @@ class EnvFile(unittest.TestCase):
 
     def test_missing_file_is_empty(self):
         self.assertEqual(parse_env_file("/nonexistent/.env"), {})
+
+
+class PairConnections(unittest.TestCase):
+    """`--to-connection` is matched to `--to-audience` by position, one for one."""
+
+    def test_no_ids_leaves_every_target_to_the_picker(self):
+        self.assertEqual(pair_connections(["aud_1", "aud_2"], []), [None, None])
+
+    def test_one_per_target_pairs_in_order(self):
+        self.assertEqual(
+            pair_connections(["aud_1", "aud_2"], ["ii_1", "ii_2"]), ["ii_1", "ii_2"]
+        )
+
+    def test_single_target_single_connection(self):
+        self.assertEqual(pair_connections(["aud_1"], ["ii_1"]), ["ii_1"])
+
+    def test_one_connection_for_many_targets_is_refused(self):
+        # A connection id belongs to one audience, so it cannot be reused across them.
+        with self.assertRaises(SegmentError):
+            pair_connections(["aud_1", "aud_2"], ["ii_1"])
+
+    def test_more_connections_than_targets_is_refused(self):
+        with self.assertRaises(SegmentError):
+            pair_connections(["aud_1"], ["ii_1", "ii_2"])
+
+
+class PlanTarget(unittest.TestCase):
+    """What gets deleted and created on one target, per mode."""
+
+    def setUp(self):
+        self.selected = [
+            {"id": "act_a", "activationName": "Entered"},
+            {"id": "act_b", "activationName": "Exited"},
+        ]
+        self.on_target = [{"id": "act_old", "activationName": "Entered"}]
+
+    def test_replace_removes_everything_on_target_and_creates_all(self):
+        to_remove, planned, skipped = plan_target(
+            self.selected, self.on_target, replace=True, allow_duplicates=False
+        )
+        self.assertEqual(to_remove, self.on_target)
+        self.assertEqual(planned, self.selected)
+        self.assertEqual(skipped, [])
+
+    def test_no_replace_skips_a_name_that_already_exists(self):
+        to_remove, planned, skipped = plan_target(
+            self.selected, self.on_target, replace=False, allow_duplicates=False
+        )
+        self.assertEqual(to_remove, [])
+        self.assertEqual([a["id"] for a in planned], ["act_b"])
+        self.assertEqual(skipped, ["Entered"])
+
+    def test_no_replace_with_duplicates_allowed_keeps_the_collision(self):
+        to_remove, planned, skipped = plan_target(
+            self.selected, self.on_target, replace=False, allow_duplicates=True
+        )
+        self.assertEqual(to_remove, [])
+        self.assertEqual(planned, self.selected)
+        self.assertEqual(skipped, [])
+
+    def test_empty_target_under_no_replace_creates_all(self):
+        to_remove, planned, skipped = plan_target(
+            self.selected, [], replace=False, allow_duplicates=False
+        )
+        self.assertEqual((to_remove, planned, skipped), ([], self.selected, []))
 
 
 if __name__ == "__main__":

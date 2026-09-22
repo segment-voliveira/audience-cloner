@@ -1036,13 +1036,15 @@ class ActivationCloneOptions:
     replace: bool = True
     from_audience: str | None = None
     from_connection: str | None = None
-    to_audience: str | None = None
-    to_connection: str | None = None
+    to_audiences: list[str] = field(default_factory=list)
+    to_connections: list[str] = field(default_factory=list)
     activation_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ActivationCloneReport:
+    """What happened on one target audience/destination pair."""
+
     target_name: str = ""
     target_audience_id: str = ""
     total: int = 0
@@ -1054,6 +1056,81 @@ class ActivationCloneReport:
     # Payloads of everything deleted, so a failed run can be rebuilt by hand.
     removed_payloads: list[dict] = field(default_factory=list)
     creates_aborted: bool = False
+    # False when an earlier target's failed delete stopped the run before this one.
+    attempted: bool = True
+
+
+@dataclass
+class ActivationCloneRun:
+    """One `activations clone` invocation, which may cover several targets."""
+
+    targets: list[ActivationCloneReport] = field(default_factory=list)
+
+
+@dataclass
+class TargetPlan:
+    """A single target's resolved pair and the work queued against it."""
+
+    audience: dict
+    connection: dict
+    include_entities: bool
+    to_remove: list[dict] = field(default_factory=list)
+    planned: list[dict] = field(default_factory=list)
+    skipped_names: list[str] = field(default_factory=list)
+
+    @property
+    def audience_id(self) -> str:
+        return self.audience.get("id") or ""
+
+    @property
+    def connection_id(self) -> str:
+        return self.connection.get("id") or ""
+
+
+def pair_connections(target_ids: list[str], connection_ids: list[str]) -> list[str | None]:
+    """Line up `--to-connection` ids with `--to-audience` ids, positionally.
+
+    A connection id is scoped to one audience/destination pair, so one id cannot
+    serve several targets — either give one per target, in order, or none at all
+    and let the picker resolve each.
+    """
+    if not connection_ids:
+        return [None] * len(target_ids)
+    if len(connection_ids) == len(target_ids):
+        return list(connection_ids)
+    raise SegmentError(
+        f"Got {len(connection_ids)} --to-connection id(s) for {len(target_ids)} target "
+        "audience(s).",
+        "Connection ids belong to a single audience, so pass one --to-connection per "
+        "--to-audience in the same order, or none and pick them interactively.",
+    )
+
+
+def plan_target(
+    selected: list[dict],
+    on_target: list[dict],
+    replace: bool,
+    allow_duplicates: bool,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Decide what to delete and create on one target. Returns (remove, create, skipped).
+
+    Replace mode (the default) clears the target destination first, so it ends up
+    mirroring the source exactly rather than accumulating. Without it, names that
+    already exist are skipped instead.
+    """
+    if replace:
+        return list(on_target), list(selected), []
+
+    existing_names = {a.get("activationName") for a in on_target}
+    planned: list[dict] = []
+    skipped_names: list[str] = []
+    for activation in selected:
+        name = activation.get("activationName")
+        if name in existing_names and not allow_duplicates:
+            skipped_names.append(str(name))
+            continue
+        planned.append(activation)
+    return [], planned, skipped_names
 
 
 def _resolve_audience(
@@ -1073,6 +1150,64 @@ def _resolve_audience(
     chosen = choose_one(ordered, audience_label, heading, question, out, prompter)
     # The list payload is a summary; fetch the full object for audienceType etc.
     return client.get_audience(chosen["id"])
+
+
+def _resolve_audiences(
+    client: SegmentClient,
+    out: Out,
+    prompter: Prompter,
+    audience_ids: list[str],
+    heading: str,
+    question: str,
+    cache: dict[str, list[dict]],
+    exclude_id: str = "",
+) -> list[dict]:
+    """Target-side counterpart of `_resolve_audience`: one or more audiences.
+
+    `exclude_id` is kept out of the picker — the source audience is not a useful
+    target, and under replace it is refused outright later anyway. An explicit
+    --to-audience is still honoured, for the one real case: the same audience on a
+    *different* destination connection.
+
+    Duplicates are collapsed — picking the same audience twice is one run over it,
+    not two.
+    """
+    if audience_ids:
+        chosen = [client.get_audience(audience_id) for audience_id in audience_ids]
+    else:
+        # choose_many defaults to "all", and a non-interactive prompt takes the
+        # default — which here would mean every audience in the space, with replace
+        # mode deleting the activations on each. Refuse instead.
+        if not prompter.interactive:
+            raise SegmentError(
+                "No target audience given and there is no terminal to pick one.",
+                "Pass --to-audience ID (repeatable) — this flow will not default to every "
+                "audience in the space.",
+            )
+        if "audiences" not in cache:
+            cache["audiences"] = client.list_audiences()
+        candidates = [a for a in cache["audiences"] if (a.get("id") or "") != exclude_id]
+        if not candidates:
+            raise SegmentError(
+                "There is no other audience in this space to copy activations into.",
+                "Create the target audience first, or pass --to-audience to target the source "
+                "audience itself on a different destination.",
+            )
+        ordered = sorted(candidates, key=lambda a: (a.get("name") or "").lower())
+        picked = choose_many(ordered, audience_label, heading, question, out, prompter)
+        # The list payload is a summary; fetch the full object for audienceType etc.
+        chosen = [client.get_audience(audience["id"]) for audience in picked]
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for audience in chosen:
+        audience_id = audience.get("id") or ""
+        if audience_id in seen:
+            out.note(f"  skipping repeated target: {audience.get('name')} ({audience_id})")
+            continue
+        seen.add(audience_id)
+        unique.append(audience)
+    return unique
 
 
 def _resolve_connection(
@@ -1113,11 +1248,12 @@ def clone_activations(
     out: Out,
     prompter: Prompter,
     options: ActivationCloneOptions,
-) -> ActivationCloneReport:
-    """Copy activations from one (audience, destination connection) pair onto another.
+) -> ActivationCloneRun:
+    """Copy activations from one (audience, destination connection) pair onto others.
 
-    Both sides must already exist — this creates only the activations, using the same
-    addActivationToAudience endpoint the full clone uses.
+    Every side must already exist — this creates only the activations, using the same
+    addActivationToAudience endpoint the full clone uses. One source fans out to any
+    number of target audiences, each with its own destination connection.
     """
     cache: dict[str, list[dict]] = {}
 
@@ -1169,96 +1305,111 @@ def clone_activations(
         )
 
     # --- target side ---
-    target_audience = _resolve_audience(
-        client, out, prompter, options.to_audience,
-        "Target audiences", "Number of the audience to copy activations INTO", cache,
+    target_audiences = _resolve_audiences(
+        client, out, prompter, options.to_audiences,
+        "Target audiences", "Which audiences to copy activations INTO", cache,
+        exclude_id=source_id,
     )
-    target_id = target_audience["id"]
-    target_type = target_audience.get("audienceType") or "USERS"
-    out.note(f"  into audience: {target_audience.get('name')} ({target_id})")
-
-    target_connection = _resolve_connection(
-        client, out, prompter, target_id, options.to_connection,
-        "Target destinations", "Number of the destination to copy activations INTO",
+    wanted_connections = pair_connections(
+        [a.get("id") or "" for a in target_audiences], options.to_connections
     )
-    target_connection_id = target_connection.get("id") or ""
-    out.note(f"  into destination: {connection_label(target_connection)}")
 
-    # --- guards ---
-    if source_connection_id == target_connection_id:
-        if options.replace:
-            # Replace deletes the target's activations first, which here are the very
-            # ones being copied — a no-op at best, data loss at worst.
-            raise SegmentError(
-                "Source and target are the same audience/destination pair.",
-                "Replace mode would delete the activations it is copying from. Pick a different "
-                "target.",
-            )
-        if not options.allow_duplicates:
-            raise SegmentError(
-                "Source and target are the same audience/destination pair.",
-                "That would duplicate the activations in place. Pick a different target, or pass "
-                "--allow-duplicates if duplicates are really what you want.",
+    plans: list[TargetPlan] = []
+    for target_audience, wanted_connection in zip(target_audiences, wanted_connections):
+        target_id = target_audience["id"]
+        target_type = target_audience.get("audienceType") or "USERS"
+        out.note(f"  into audience: {target_audience.get('name')} ({target_id})")
+
+        target_connection = _resolve_connection(
+            client, out, prompter, target_id, wanted_connection,
+            f"Destinations on {target_audience.get('name')}",
+            "Number of the destination to copy activations INTO",
+        )
+        out.note(f"  into destination: {connection_label(target_connection)}")
+
+        # --- guards, per target ---
+        if source_connection_id == (target_connection.get("id") or ""):
+            if options.replace:
+                # Replace deletes the target's activations first, which here are the very
+                # ones being copied — a no-op at best, data loss at worst.
+                raise SegmentError(
+                    f"{target_audience.get('name')} is the same audience/destination pair as "
+                    "the source.",
+                    "Replace mode would delete the activations it is copying from. Pick a "
+                    "different target.",
+                )
+            if not options.allow_duplicates:
+                raise SegmentError(
+                    f"{target_audience.get('name')} is the same audience/destination pair as "
+                    "the source.",
+                    "That would duplicate the activations in place. Pick a different target, or "
+                    "pass --allow-duplicates if duplicates are really what you want.",
+                )
+
+        if source_connection.get("destinationId") != target_connection.get("destinationId"):
+            out.warn(
+                f"{target_audience.get('name')} points at a different destination than the "
+                "source. destinationMapping.actionId and any destination-specific settings are "
+                "unlikely to be valid there."
             )
 
-    if source_connection.get("destinationId") != target_connection.get("destinationId"):
-        out.warn(
-            "Source and target point at different destinations. destinationMapping.actionId "
-            "and any destination-specific settings are unlikely to be valid on the target."
+        include_entities = target_type == "LINKED"
+        if not include_entities and any(
+            (a.get("personalization") or {}).get("entities") for a in selected
+        ):
+            out.warn(
+                f"{target_audience.get('name')} is {target_type}, not LINKED — entity "
+                "personalization will be dropped, since classic audiences reject it."
+            )
+
+        existing_activations, _ = client.list_activations(target_id)
+        on_target = [
+            a
+            for a in existing_activations
+            if a.get("connectionId") == (target_connection.get("id") or "")
+        ]
+        to_remove, planned, skipped_names = plan_target(
+            selected, on_target, options.replace, options.allow_duplicates
+        )
+        for name in skipped_names:
+            out.warn(
+                f"Activation {name!r} already exists on {target_audience.get('name')} — skipping."
+            )
+        plans.append(
+            TargetPlan(
+                audience=target_audience,
+                connection=target_connection,
+                include_entities=include_entities,
+                to_remove=to_remove,
+                planned=planned,
+                skipped_names=skipped_names,
+            )
         )
 
-    include_entities = target_type == "LINKED"
-    if not include_entities and any(
-        (a.get("personalization") or {}).get("entities") for a in selected
-    ):
-        out.warn(
-            f"Target audience is {target_type}, not LINKED — entity personalization will be "
-            "dropped, since classic audiences reject it."
-        )
-
-    existing_activations, _ = client.list_activations(target_id)
-    on_target = [
-        a for a in existing_activations if a.get("connectionId") == target_connection_id
-    ]
-
-    report = ActivationCloneReport(
-        target_name=target_audience.get("name") or "",
-        target_audience_id=target_id,
+    run = ActivationCloneRun(
+        targets=[
+            ActivationCloneReport(
+                target_name=plan.audience.get("name") or "",
+                target_audience_id=plan.audience_id,
+                total=len(plan.planned),
+                remove_total=len(plan.to_remove),
+                skipped=len(plan.skipped_names),
+            )
+            for plan in plans
+        ]
     )
 
-    # Replace mode (the default) clears the target destination first, so it ends up
-    # mirroring the source exactly rather than accumulating. Without it, names that
-    # already exist are skipped instead.
-    to_remove: list[dict] = []
-    planned: list[dict] = []
-    if options.replace:
-        to_remove = on_target
-    else:
-        existing_names = {a.get("activationName") for a in on_target}
-        for activation in selected:
-            name = activation.get("activationName")
-            if name in existing_names and not options.allow_duplicates:
-                out.warn(f"Activation {name!r} already exists on the target — skipping.")
-                report.skipped += 1
-                continue
-            planned.append(activation)
-
-    if options.replace:
-        planned = list(selected)
-
-    report.total = len(planned)
-    report.remove_total = len(to_remove)
-
-    if not planned and not to_remove:
+    total_remove = sum(len(plan.to_remove) for plan in plans)
+    total_create = sum(len(plan.planned) for plan in plans)
+    if not total_remove and not total_create:
         out.warn("Nothing to do.")
-        return report
+        return run
 
-    if to_remove:
+    if total_remove:
         out.info()
         out.warn(
-            f"{out.bold}This REPLACES the target's activations.{out.reset} "
-            f"{len(to_remove)} existing activation(s) on "
-            f"{target_audience.get('name')} → {connection_label(target_connection)} "
+            f"{out.bold}This REPLACES the targets' activations.{out.reset} "
+            f"{total_remove} existing activation(s) across {len(plans)} target(s) "
             "will be DELETED, then replaced with copies from the source."
         )
         out.note("  Deleting an activation stops that data flowing to the destination.")
@@ -1266,37 +1417,73 @@ def clone_activations(
 
     out.info()
     out.info(f"{out.bold}Plan{out.reset}")
-    step = 1
-    if to_remove:
-        out.info(f"  {step}. delete {len(to_remove)} existing activation(s):")
-        for activation in to_remove:
-            out.info(f"       - {activation_label(activation)}  ({activation.get('id')})")
-        step += 1
-    out.info(
-        f"  {step}. create {len(planned)} activation(s) on {target_audience.get('name')} "
-        f"→ {connection_label(target_connection)}:"
-    )
-    for activation in planned:
-        out.json_line(activation_payload(activation, options.resync, include_entities), "       ")
+    for index, plan in enumerate(plans, start=1):
+        out.info(
+            f"  {out.bold}target {index}/{len(plans)}{out.reset}  "
+            f"{plan.audience.get('name')} → {connection_label(plan.connection)}"
+        )
+        step = 1
+        if plan.to_remove:
+            out.info(f"    {step}. delete {len(plan.to_remove)} existing activation(s):")
+            for activation in plan.to_remove:
+                out.info(f"         - {activation_label(activation)}  ({activation.get('id')})")
+            step += 1
+        out.info(f"    {step}. create {len(plan.planned)} activation(s):")
+        for activation in plan.planned:
+            out.json_line(
+                activation_payload(activation, options.resync, plan.include_entities), "         "
+            )
     out.info()
 
     if options.dry_run:
         out.warn("--dry-run: nothing was deleted or created.")
-        return report
+        return run
 
+    scope = f"{len(plans)} target audience(s)"
     question = (
-        f"Delete {len(to_remove)} and create {len(planned)} activation(s) on {target_id}?"
-        if to_remove
-        else f"Create {len(planned)} activation(s) on {target_id}?"
+        f"Delete {total_remove} and create {total_create} activation(s) across {scope}?"
+        if total_remove
+        else f"Create {total_create} activation(s) across {scope}?"
     )
     if not prompter.confirm(question):
         out.warn("Aborted.")
         raise SystemExit(1)
 
-    # --- delete first ---
-    for activation in to_remove:
+    for index, (plan, report) in enumerate(zip(plans, run.targets)):
+        out.info()
+        out.info(
+            f"{out.bold}target {index + 1}/{len(plans)}{out.reset}  "
+            f"{plan.audience.get('name')} → {connection_label(plan.connection)}"
+        )
+        _apply_target(client, out, options, plan, report)
+
+        # A failed delete means the old activation is still live, so this target's
+        # creates were skipped. The cause is rarely target-specific — a token,
+        # permission or rate-limit problem recurs — and each further target would
+        # delete more live activations before hitting it, so stop the whole run.
+        if report.creates_aborted:
+            for remaining in run.targets[index + 1 :]:
+                remaining.attempted = False
+            if index + 1 < len(plans):
+                out.warn(
+                    f"Stopping: {len(plans) - index - 1} remaining target(s) were not touched."
+                )
+            break
+
+    return run
+
+
+def _apply_target(
+    client: SegmentClient,
+    out: Out,
+    options: ActivationCloneOptions,
+    plan: TargetPlan,
+    report: ActivationCloneReport,
+) -> None:
+    """Delete then create one target's activations, recording what happened."""
+    for activation in plan.to_remove:
         name = activation.get("activationName") or activation.get("id") or "?"
-        result = client.remove_activation(target_id, activation.get("id") or "")
+        result = client.remove_activation(plan.audience_id, activation.get("id") or "")
         if result.ok:
             report.removed += 1
             report.removed_payloads.append(
@@ -1313,14 +1500,14 @@ def clone_activations(
     if any(f.startswith("delete ") for f in report.failures):
         report.creates_aborted = True
         out.warn("Skipping creation because at least one delete failed.")
-        return report
+        return
 
-    for activation in planned:
+    for activation in plan.planned:
         name = activation.get("activationName") or activation.get("id") or "?"
         result = client.add_activation(
-            target_id,
-            target_connection_id,
-            activation_payload(activation, options.resync, include_entities),
+            plan.audience_id,
+            plan.connection_id,
+            activation_payload(activation, options.resync, plan.include_entities),
         )
         if result.ok:
             report.done += 1
@@ -1330,13 +1517,29 @@ def clone_activations(
             report.failures.append(f"activation {name!r}: {result.message}")
             out.warn(f"Activation {name!r} failed: {result.message}")
 
-    return report
+
+def print_activation_run(out: Out, run: ActivationCloneRun, dry_run: bool) -> int:
+    """Render every target's outcome and decide the exit code for the run."""
+    if dry_run:
+        return 0
+    status = 0
+    for report in run.targets:
+        if print_activation_report(out, report, dry_run) != 0:
+            status = 1
+    return status
 
 
 def print_activation_report(out: Out, report: ActivationCloneReport, dry_run: bool) -> int:
     if dry_run:
         return 0
     out.info()
+    if not report.attempted:
+        out.warn(
+            f"Not attempted: {report.target_name}  "
+            f"{out.dim}({report.target_audience_id}){out.reset} — the run stopped after a "
+            "failed delete on an earlier target."
+        )
+        return 1
     out.info(
         f"{out.bold}Copied{out.reset} into {report.target_name}  "
         f"{out.dim}({report.target_audience_id}){out.reset}"
@@ -1448,12 +1651,12 @@ def _add_activation_clone_flags(parser: argparse.ArgumentParser) -> None:
         help="source destination connection id, ii_…",
     )
     parser.add_argument(
-        "--to-audience", metavar="ID", default=argparse.SUPPRESS,
-        help="target audience id (skips the picker)",
+        "--to-audience", metavar="ID", action="append", default=argparse.SUPPRESS,
+        help="target audience id (repeatable; skips the picker)",
     )
     parser.add_argument(
-        "--to-connection", metavar="ID", default=argparse.SUPPRESS,
-        help="target destination connection id, ii_…",
+        "--to-connection", metavar="ID", action="append", default=argparse.SUPPRESS,
+        help="target destination connection id, ii_… (one per --to-audience, same order)",
     )
     parser.add_argument(
         "--activation", metavar="ID", action="append", default=argparse.SUPPRESS,
@@ -1584,12 +1787,12 @@ def main(argv: list[str] | None = None) -> int:
                 replace=not flag("no_replace"),
                 from_audience=getattr(args, "from_audience", None),
                 from_connection=getattr(args, "from_connection", None),
-                to_audience=getattr(args, "to_audience", None),
-                to_connection=getattr(args, "to_connection", None),
+                to_audiences=list(getattr(args, "to_audience", []) or []),
+                to_connections=list(getattr(args, "to_connection", []) or []),
                 activation_ids=list(getattr(args, "activation", []) or []),
             )
-            activation_report = clone_activations(client, out, prompter, activation_options)
-            return print_activation_report(out, activation_report, activation_options.dry_run)
+            activation_run = clone_activations(client, out, prompter, activation_options)
+            return print_activation_run(out, activation_run, activation_options.dry_run)
 
         parser.print_help(sys.stderr)
         return 1

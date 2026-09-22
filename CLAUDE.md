@@ -9,15 +9,16 @@ for cloning Engage audiences and activations. Two flows:
 
 1. `audiences clone` — creates a **new** audience from an existing one: definition → destination
    connections → activations.
-2. `activations clone` — copies activations onto an audience + destination that **already exist**.
-   Replaces by default (deletes the target destination's activations first).
+2. `activations clone` — copies activations onto **one or more** audience + destination pairs that
+   **already exist**. Replaces by default (deletes each target destination's activations first).
+   One source and one activation selection fan out to every target; `--to-audience` is repeatable.
 
 A bare `./segment.py` asks which flow to run.
 
 ## Commands
 
 ```sh
-python3 -m unittest test_payloads -v              # all 26 tests, no network
+python3 -m unittest test_payloads -v              # all 35 tests, no network
 python3 -m unittest test_payloads.AudiencePayload # one class
 python3 -m unittest test_payloads.ActivationPayload.test_drops_server_generated_fields
 python3 -m py_compile segment.py                  # syntax check
@@ -50,10 +51,15 @@ Layered inside `segment.py`, top to bottom:
   of dying halfway. `paged()` walks cursors and returns `(items, total_entries)`.
 - **Payload builders** — `audience_payload`, `connection_payload`, `activation_payload`. Pure
   functions, no I/O, fully unit-tested. New API shapes belong here.
+- **Decision helpers** — `plan_target` (what to delete/create on one target) and `pair_connections`
+  (match `--to-connection` ids to `--to-audience` ids positionally). Also pure and unit-tested; keep
+  new branching logic here rather than inline in a flow, so it can be tested without a network.
 - **Pickers** — `choose_one` / `choose_many` (fzf when available, numbered menu otherwise;
   auto-select when there's one candidate), `choose_mode` for the entry-point question.
-- **Flows** — `clone_audience` / `clone_activations`, each returning a report dataclass rendered by
-  a matching `print_*_report` that decides the exit code.
+- **Flows** — `clone_audience` / `clone_activations`. `clone_audience` returns one report;
+  `clone_activations` returns an `ActivationCloneRun` holding one `ActivationCloneReport` per target
+  (`_apply_target` does the writes for one). `print_*_report` / `print_activation_run` render them
+  and decide the exit code.
 
 Human-facing output goes to **stderr** via `Out`; stdout stays clean for piping.
 
@@ -97,16 +103,30 @@ user confirmed it was the token.)
 ## Destructive-operation invariants in `clone_activations`
 
 Replace mode deletes before it creates, so a mid-run failure can leave the destination with *fewer*
-activations than it started with. Two rules exist because of that — preserve them:
+activations than it started with. A run can now span several targets, which multiplies that. Three
+rules exist because of that — preserve them:
 
-1. **If any delete fails, no creates run.** Otherwise the stale activation and its replacement are
-   both live and double-send events to the destination.
-2. **If the run ends short**, print the payloads of everything deleted (`removed_payloads`) so they
-   can be rebuilt. These are the *original* definitions, not the source's.
+1. **If any delete fails, no creates run** on that target. Otherwise the stale activation and its
+   replacement are both live and double-send events to the destination.
+2. **A failed delete also abandons the remaining targets** (`attempted = False`, non-zero exit).
+   The cause is rarely target-specific — token, permission, rate limit — and continuing would delete
+   more live activations before hitting the same wall. Do not "helpfully" carry on to the next target.
+3. **If a target ends short**, print the payloads of everything deleted there (`removed_payloads`)
+   so they can be rebuilt. These are the *original* definitions, not the source's.
 
-Also: source and target being the same audience/destination pair is refused outright under replace —
-it would delete the activations being copied. `--allow-duplicates` only overrides this under
-`--no-replace`.
+All of this is per target, computed up front: every target's plan is built and printed before a
+single write, then **one** confirmation covers the whole run. Nothing is resolved lazily mid-write.
+
+Also: a target being the same audience/destination pair as the source is refused outright under
+replace — it would delete the activations being copied. `--allow-duplicates` only overrides this
+under `--no-replace`. Selecting the same target audience twice collapses to one run over it, since
+the second pass would delete what the first just created.
+
+The source audience is filtered out of the target picker (`_resolve_audiences(..., exclude_id=)`),
+so the refusal above is unreachable by mis-clicking. An explicit `--to-audience <source>` is still
+honoured on purpose — same audience, *different* destination connection is legitimate. When the
+filter empties the list (a space with one audience), say so rather than presenting a list of one
+useless option.
 
 ## Testing approach
 
